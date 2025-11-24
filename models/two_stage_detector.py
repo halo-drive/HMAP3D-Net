@@ -1,4 +1,4 @@
-"""Two-Stage Monocular 3D Object Detection - Multi-Class Support"""
+"""Two-Stage 3D Detection - With Anti-Overfitting Regularization"""
 
 import torch
 import torch.nn as nn
@@ -9,18 +9,14 @@ from ultralytics import YOLO
 import numpy as np
 
 
-# COCO to KITTI class mapping
 COCO_TO_KITTI = {
-    0: 'Pedestrian',  # COCO person
-    1: 'Cyclist',     # COCO bicycle  
-    2: 'Car',         # COCO car
-    3: 'Cyclist',     # COCO motorcycle → treat as Cyclist
-    5: 'Car',         # COCO bus → treat as Car (large vehicle)
-    7: 'Car',         # COCO truck → treat as Car (large vehicle)
+    0: 'Pedestrian',
+    1: 'Cyclist',
+    2: 'Car',
+    3: 'Cyclist',
+    5: 'Car',
+    7: 'Car',
 }
-
-# KITTI classes we want to train on (will be set by config)
-ACTIVE_KITTI_CLASSES = ['Car', 'Pedestrian', 'Cyclist']
 
 
 class Depth3DHead(nn.Module):
@@ -29,9 +25,10 @@ class Depth3DHead(nn.Module):
         self.fc = nn.Sequential(
             nn.Linear(in_channels, 512),
             nn.ReLU(),
-            nn.Dropout(0.3),
+            nn.Dropout(0.5),  # Increased from 0.3
             nn.Linear(512, 256),
             nn.ReLU(),
+            nn.Dropout(0.3),  # Added extra dropout
             nn.Linear(256, 3)
         )
     
@@ -49,7 +46,7 @@ class Dimension3DHead(nn.Module):
         self.fc = nn.Sequential(
             nn.Linear(in_channels, 512),
             nn.ReLU(),
-            nn.Dropout(0.3),
+            nn.Dropout(0.5),  # Increased from 0.3
             nn.Linear(512, 3)
         )
     
@@ -67,14 +64,14 @@ class Rotation3DHead(nn.Module):
         self.fc_bin = nn.Sequential(
             nn.Linear(in_channels, 512),
             nn.ReLU(),
-            nn.Dropout(0.3),
+            nn.Dropout(0.5),  # Increased from 0.3
             nn.Linear(512, num_bins)
         )
         
         self.fc_res = nn.Sequential(
             nn.Linear(in_channels, 512),
             nn.ReLU(),
-            nn.Dropout(0.3),
+            nn.Dropout(0.5),  # Increased from 0.3
             nn.Linear(512, num_bins)
         )
     
@@ -88,16 +85,16 @@ class TwoStage3DDetector(nn.Module):
     def __init__(self, yolo_model='yolov8x.pt', freeze_2d=True, active_classes=None):
         super().__init__()
         
-        # Set active classes
         if active_classes is None:
             active_classes = ['Car', 'Pedestrian', 'Cyclist']
         self.active_classes = set(active_classes)
         
-        # Build COCO class filter based on active KITTI classes
+        self.coco_to_kitti_map = {}
         self.valid_coco_classes = []
         for coco_id, kitti_class in COCO_TO_KITTI.items():
             if kitti_class in self.active_classes:
                 self.valid_coco_classes.append(coco_id)
+                self.coco_to_kitti_map[coco_id] = kitti_class
         
         print(f"Active KITTI classes: {self.active_classes}")
         print(f"Mapped COCO classes: {self.valid_coco_classes}")
@@ -117,7 +114,7 @@ class TwoStage3DDetector(nn.Module):
         # RoI Align
         self.roi_align = RoIAlign(output_size=(7, 7), spatial_scale=1.0/32, sampling_ratio=2)
         
-        # 3D Regression Heads
+        # 3D Regression Heads (with increased dropout)
         self.depth_head = Depth3DHead(in_channels=2048)
         self.dimension_head = Dimension3DHead(in_channels=2048)
         self.rotation_head = Rotation3DHead(in_channels=2048, num_bins=12)
@@ -125,10 +122,11 @@ class TwoStage3DDetector(nn.Module):
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
     
     def extract_2d_boxes(self, images):
-        """Extract 2D boxes with CLASS FILTERING"""
+        """Extract 2D boxes with class tracking"""
         batch_size = images.shape[0]
         boxes_list = []
         scores_list = []
+        classes_list = []
         
         yolo = object.__getattribute__(self, '_yolo_model')
         
@@ -141,36 +139,42 @@ class TwoStage3DDetector(nn.Module):
             if len(results[0].boxes) > 0:
                 boxes = results[0].boxes.xyxy.cpu()
                 scores = results[0].boxes.conf.cpu()
-                classes = results[0].boxes.cls.cpu().numpy().astype(int)
+                coco_classes = results[0].boxes.cls.cpu().numpy().astype(int)
                 
-                # Filter by COCO class (only those that map to active KITTI classes)
-                keep_mask = torch.tensor([cls in self.valid_coco_classes for cls in classes])
-                
-                # Apply confidence threshold
+                keep_mask = torch.tensor([cls in self.valid_coco_classes for cls in coco_classes])
                 conf_mask = scores > 0.5
                 keep_mask = keep_mask & conf_mask
                 
                 boxes = boxes[keep_mask]
                 scores = scores[keep_mask]
+                coco_classes_filtered = coco_classes[keep_mask.numpy()]
+                
+                kitti_classes = [self.coco_to_kitti_map[coco_id] for coco_id in coco_classes_filtered]
             else:
                 boxes = torch.zeros((0, 4))
                 scores = torch.zeros((0,))
+                kitti_classes = []
             
             boxes_list.append(boxes)
             scores_list.append(scores)
+            classes_list.append(kitti_classes)
         
-        return boxes_list, scores_list
+        return boxes_list, scores_list, classes_list
     
-    def forward(self, images, intrinsics=None, gt_boxes_2d=None):
+    def forward(self, images, intrinsics=None, gt_boxes_2d=None, gt_classes=None):
         batch_size = images.shape[0]
         device = images.device
         
         if gt_boxes_2d is not None:
             boxes_list = [gt_boxes_2d[i] for i in range(batch_size)]
             scores_list = [torch.ones(len(boxes_list[i]), device=device) for i in range(batch_size)]
+            if gt_classes is not None:
+                classes_list = gt_classes
+            else:
+                classes_list = [[] for _ in range(batch_size)]
         else:
             with torch.no_grad():
-                boxes_list, scores_list = self.extract_2d_boxes(images)
+                boxes_list, scores_list, classes_list = self.extract_2d_boxes(images)
         
         features = self.feature_backbone(images)
         
@@ -206,6 +210,7 @@ class TwoStage3DDetector(nn.Module):
         return {
             'boxes_2d': boxes_list,
             'scores_2d': scores_list,
+            'classes': classes_list,
             'depth': all_depths,
             'dimensions': all_dims,
             'rotation': all_rotations
@@ -213,15 +218,8 @@ class TwoStage3DDetector(nn.Module):
 
 
 def build_model(active_classes=None):
-    """
-    Build model with specified active classes
-    
-    Args:
-        active_classes: List of KITTI classes to train on
-                       e.g., ['Car'], ['Car', 'Pedestrian'], ['Car', 'Pedestrian', 'Cyclist']
-    """
     if active_classes is None:
-        active_classes = ['Car']  # Default: Car only
+        active_classes = ['Car']
     
     model = TwoStage3DDetector(
         yolo_model='yolov8x.pt', 
