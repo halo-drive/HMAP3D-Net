@@ -1,4 +1,4 @@
-"""Inference Script - Multi-Class with Proper Class Tracking"""
+"""Inference Script - Fixed 3D Unprojection"""
 
 import os
 import sys
@@ -61,19 +61,23 @@ class InferenceEngine:
         return predictions, inference_time
     
     def decode_predictions(self, predictions, intrinsics):
-        """Decode predictions to 3D boxes WITH CLASS NAMES"""
+        """Decode predictions - FIXED UNPROJECTION"""
         boxes_2d = predictions['boxes_2d'][0]
         depth_pred = predictions['depth'][0]
         dims_pred = predictions['dimensions'][0]
         rot_bins, rot_res = predictions['rotation'][0]
         scores = predictions['scores_2d'][0]
-        class_names = predictions['classes'][0]  # NEW: Get class names
+        class_names = predictions['classes'][0]
         
         if len(boxes_2d) == 0:
             return np.zeros((0, 7)), np.zeros(0), []
         
+        # Decode depth with offset
         depth = depth_pred[:, 0].cpu().numpy()
+        depth_offset = depth_pred[:, 2].cpu().numpy()
+        depth = depth + depth_offset  # Apply learned offset
         
+        # Decode rotation
         rot_bin_idx = torch.argmax(rot_bins, dim=1).cpu().numpy()
         bin_size = 2 * np.pi / 12
         rotation = (rot_bin_idx + 0.5) * bin_size
@@ -83,13 +87,19 @@ class InferenceEngine:
         
         dims = dims_pred.cpu().numpy()
         
+        # CRITICAL FIX: Use bottom-center of 2D box
         K = intrinsics.cpu().numpy()
         boxes_2d_np = boxes_2d.cpu().numpy()
-        centers_2d = (boxes_2d_np[:, :2] + boxes_2d_np[:, 2:]) / 2
         
-        x_cam = (centers_2d[:, 0] - K[0, 2]) * depth / K[0, 0]
-        y_cam = (centers_2d[:, 1] - K[1, 2]) * depth / K[1, 1]
+        x_2d = (boxes_2d_np[:, 0] + boxes_2d_np[:, 2]) / 2
+        y_2d = boxes_2d_np[:, 3]  # Bottom edge
+        
+        x_cam = (x_2d - K[0, 2]) * depth / K[0, 0]
+        y_cam_bottom = (y_2d - K[1, 2]) * depth / K[1, 1]
         z_cam = depth
+        
+        # Shift to geometric center
+        y_cam = y_cam_bottom - dims[:, 0] / 2.0
         
         boxes_3d = np.stack([x_cam, y_cam, z_cam, dims[:, 0], dims[:, 1], dims[:, 2], rotation], axis=1)
         scores_np = scores.cpu().numpy()
@@ -107,9 +117,9 @@ def project_3d_box(box_3d, K):
     corners_3d = np.array([x_corners, y_corners, z_corners])
     
     R = np.array([
-        [np.cos(ry), 0, np.sin(ry)],
+        [np.cos(ry), 0, -np.sin(ry)],
         [0, 1, 0],
-        [-np.sin(ry), 0, np.cos(ry)]
+        [np.sin(ry), 0, np.cos(ry)]
     ])
     corners_3d = R @ corners_3d
     
@@ -146,7 +156,6 @@ def draw_3d_box(image, box_3d, K, color=(0, 255, 0), thickness=2, score=None, cl
     front_center = ((corners_2d[0] + corners_2d[3] + corners_2d[4] + corners_2d[7]) / 4).astype(np.int32)
     cv2.circle(image, tuple(front_center), 5, (255, 0, 0), -1)
     
-    # Label
     if class_name and score is not None:
         label = f'{class_name} {score:.2f}'
     elif class_name:
@@ -176,7 +185,6 @@ def visualize_comparison(image, boxes_3d_pred, boxes_3d_gt, scores, K, output_pa
     axes[0].set_title('Input Image')
     axes[0].axis('off')
     
-    # Ground truth
     img_gt = image.copy()
     for idx, box in enumerate(boxes_3d_gt):
         class_name = gt_classes[idx] if gt_classes and idx < len(gt_classes) else None
@@ -187,7 +195,6 @@ def visualize_comparison(image, boxes_3d_pred, boxes_3d_gt, scores, K, output_pa
     axes[1].set_title(f'Ground Truth ({len(boxes_3d_gt)} objects)')
     axes[1].axis('off')
     
-    # Predictions
     img_pred = image.copy()
     for idx, (box, score) in enumerate(zip(boxes_3d_pred, scores)):
         class_name = pred_classes[idx] if pred_classes and idx < len(pred_classes) else None
