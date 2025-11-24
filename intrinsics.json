@@ -1,0 +1,9 @@
+{
+    "fx": 2700.0,
+    "fy": 2700.0,
+    "cx": 1927.764404,
+    "cy": 1096.686646,
+    "width": 3848,
+    "height": 2168,
+    "note": "Estimated fx/fy for fisheye camera, adjust if needed"
+}
