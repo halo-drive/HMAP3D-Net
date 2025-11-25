@@ -7,7 +7,7 @@ from torchvision.ops import RoIAlign
 from torchvision.models import resnet50
 from ultralytics import YOLO
 import numpy as np
-import cv2
+
 
 COCO_TO_KITTI = {
     0: 'Pedestrian',
@@ -130,36 +130,19 @@ class TwoStage3DDetector(nn.Module):
         
         yolo = object.__getattribute__(self, '_yolo_model')
         
-        IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-        IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
-        
         for i in range(batch_size):
-            # Denormalize
-            img = images[i].cpu().numpy().transpose(1, 2, 0)
-            img = img * IMAGENET_STD + IMAGENET_MEAN
-            img = (img * 255).clip(0, 255).astype('uint8')
+            img = images[i].cpu().numpy().transpose(1, 2, 0) * 255
+            img = img.astype('uint8')
             
-            # NEW: Upscale for better YOLO detection
-            h, w = img.shape[:2]  # e.g., 384x1280
-            scale_factor = 3  # Upscale 3x
-            target_h, target_w = h * scale_factor, w * scale_factor
-            img_upscaled = cv2.resize(img, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
-            
-            # Run YOLO on upscaled image with lower threshold
-            results = yolo.predict(img_upscaled, verbose=False, conf=0.2)
+            results = yolo.predict(img, verbose=False)
             
             if len(results[0].boxes) > 0:
                 boxes = results[0].boxes.xyxy.cpu()
-                
-                # Scale boxes back to original resized dimensions
-                boxes[:, [0, 2]] /= scale_factor  # x coordinates
-                boxes[:, [1, 3]] /= scale_factor  # y coordinates
-                
                 scores = results[0].boxes.conf.cpu()
                 coco_classes = results[0].boxes.cls.cpu().numpy().astype(int)
                 
                 keep_mask = torch.tensor([cls in self.valid_coco_classes for cls in coco_classes])
-                conf_mask = scores > 0.3
+                conf_mask = scores > 0.5
                 keep_mask = keep_mask & conf_mask
                 
                 boxes = boxes[keep_mask]
@@ -177,7 +160,7 @@ class TwoStage3DDetector(nn.Module):
             classes_list.append(kitti_classes)
         
         return boxes_list, scores_list, classes_list
-
+    
     def forward(self, images, intrinsics=None, gt_boxes_2d=None, gt_classes=None):
         batch_size = images.shape[0]
         device = images.device
