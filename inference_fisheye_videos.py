@@ -126,10 +126,6 @@ class FisheyeVideoInferenceEngine:
         depth_offset = depth_pred[:, 2].cpu().numpy()
         depth = depth + depth_offset
         
-        DEPTH_SCALE = 3.0
-        DIM_SCALE = 0.3
-
-        depth = depth * DEPTH_SCALE
         
         # Decode rotation
         rot_bin_idx = torch.argmax(rot_bins, dim=1).cpu().numpy()
@@ -140,7 +136,6 @@ class FisheyeVideoInferenceEngine:
         rotation = (rotation + np.pi) % (2 * np.pi) - np.pi
         
         dims = dims_pred.cpu().numpy()
-        dims = dims * DIM_SCALE
         
         # Scale boxes back to undistorted image coordinates
         scale_x, scale_y = scales
