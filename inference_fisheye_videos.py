@@ -1,4 +1,4 @@
-"""Video Inference for Fisheye Camera (Entron F008A GMSL)"""
+"""Video Inference for Fisheye Camera (Entron F008A GMSL) - Clean Intrinsics Normalization"""
 
 import os
 import sys
@@ -35,6 +35,17 @@ class FisheyeVideoInferenceEngine:
         self.fisheye_camera = FisheyeCamera(fisheye_config)
         self.intrinsics_undistorted = self.fisheye_camera.get_undistorted_intrinsics()
         
+        # CRITICAL: Normalize intrinsics to KITTI scale
+        print("\nNormalizing intrinsics to KITTI scale...")
+        self.intrinsics_normalized = self.normalize_intrinsics_to_kitti(
+            self.intrinsics_undistorted,
+            image_shape=(fisheye_config['height'], fisheye_config['width'])
+        )
+        
+        print(f"  Original fx: {self.intrinsics_undistorted[0,0]:.1f}")
+        print(f"  Normalized fx: {self.intrinsics_normalized[0,0]:.1f}")
+        print(f"  Scale factor: {self.intrinsics_normalized[0,0]/self.intrinsics_undistorted[0,0]:.3f}")
+        
         # Load model
         print(f"\nLoading checkpoint: {checkpoint_path}")
         checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
@@ -58,6 +69,50 @@ class FisheyeVideoInferenceEngine:
         self.mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
         self.std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
     
+    def normalize_intrinsics_to_kitti(self, K_yours, image_shape):
+        """
+        Normalize intrinsics to KITTI scale
+        
+        The model was trained on KITTI where:
+          fx/image_width = 721.5377/1242 = 0.580
+        
+        This function scales your intrinsics so the focal length to image width
+        ratio matches KITTI, making the model see geometry it was trained on.
+        
+        Args:
+            K_yours: Your camera intrinsics [3x3]
+            image_shape: (height, width) of your images
+            
+        Returns:
+            K_normalized: Intrinsics scaled to KITTI equivalent
+        """
+        # KITTI reference values
+        fx_kitti = 721.5377
+        width_kitti = 1242
+        
+        # Your camera values
+        fx_yours = K_yours[0, 0]
+        fy_yours = K_yours[1, 1]
+        cx_yours = K_yours[0, 2]
+        cy_yours = K_yours[1, 2]
+        height_yours, width_yours = image_shape
+        
+        # Compute focal length / image width ratios
+        ratio_kitti = fx_kitti / width_kitti
+        ratio_yours = fx_yours / width_yours
+        
+        # Scale factor to match KITTI's ratio
+        scale_factor = ratio_kitti / ratio_yours
+        
+        # Apply scaling to all intrinsic parameters
+        K_normalized = K_yours.copy()
+        K_normalized[0, 0] *= scale_factor  # fx
+        K_normalized[1, 1] *= scale_factor  # fy
+        K_normalized[0, 2] *= scale_factor  # cx
+        K_normalized[1, 2] *= scale_factor  # cy
+        
+        return K_normalized
+    
     def preprocess_frame(self, frame):
         """Undistort and preprocess fisheye frame"""
         # Undistort fisheye
@@ -76,7 +131,7 @@ class FisheyeVideoInferenceEngine:
         # To tensor
         frame_tensor = torch.from_numpy(frame_norm.transpose(2, 0, 1)).unsqueeze(0).float()
         
-        # Scale factors
+        # Scale factors for box coordinates
         scale_x = w / target_w
         scale_y = h / target_h
         
@@ -89,8 +144,8 @@ class FisheyeVideoInferenceEngine:
         frame_tensor, frame_undistorted, scales = self.preprocess_frame(frame)
         frame_tensor = frame_tensor.to(self.device)
         
-        # Create scaled intrinsics for model input
-        K_scaled = self.intrinsics_undistorted.copy()
+        # Use NORMALIZED intrinsics scaled for model input size
+        K_scaled = self.intrinsics_normalized.copy()
         scale_x, scale_y = scales
         K_scaled[0, 0] /= scale_x  # fx
         K_scaled[1, 1] /= scale_y  # fy
@@ -110,7 +165,7 @@ class FisheyeVideoInferenceEngine:
         return boxes_3d, scores, class_names, frame_undistorted, inference_time
     
     def decode_predictions(self, predictions, scales):
-        """Decode predictions with scale adjustment"""
+        """Decode predictions with intrinsics normalization + dimension correction"""
         boxes_2d = predictions['boxes_2d'][0]
         depth_pred = predictions['depth'][0]
         dims_pred = predictions['dimensions'][0]
@@ -126,7 +181,6 @@ class FisheyeVideoInferenceEngine:
         depth_offset = depth_pred[:, 2].cpu().numpy()
         depth = depth + depth_offset
         
-        
         # Decode rotation
         rot_bin_idx = torch.argmax(rot_bins, dim=1).cpu().numpy()
         bin_size = 2 * np.pi / 12
@@ -135,11 +189,17 @@ class FisheyeVideoInferenceEngine:
         rotation = rotation + rot_res_selected.cpu().numpy()
         rotation = (rotation + np.pi) % (2 * np.pi) - np.pi
         
+        # Decode dimensions
         dims = dims_pred.cpu().numpy()
         
-        # Scale boxes back to undistorted image coordinates
+        # DIMENSION CORRECTION: Model's learned priors don't match the scene
+        # This is SEPARATE from intrinsics - it corrects for domain differences
+        DIM_SCALE = 0.3  # Tune this: 0.25-0.35 typical range
+        dims = dims * DIM_SCALE
+        
+        # Use NORMALIZED intrinsics for unprojection
         scale_x, scale_y = scales
-        K = self.intrinsics_undistorted.copy()
+        K = self.intrinsics_normalized.copy()
         
         boxes_2d_np = boxes_2d.cpu().numpy()
         boxes_2d_np[:, [0, 2]] *= scale_x
@@ -160,17 +220,18 @@ class FisheyeVideoInferenceEngine:
         
         return boxes_3d, scores_np, class_names
 
-
 def project_3d_box(box_3d, K):
-    """Project 3D box to 2D"""
+    """Project 3D box to 2D image coordinates"""
     x, y, z, h, w, l, ry = box_3d
     
+    # Define 8 corners in object coordinate system
     x_corners = [l/2, -l/2, -l/2, l/2, l/2, -l/2, -l/2, l/2]
     y_corners = [h/2, h/2, h/2, h/2, -h/2, -h/2, -h/2, -h/2]
     z_corners = [w/2, w/2, -w/2, -w/2, w/2, w/2, -w/2, -w/2]
     
     corners_3d = np.array([x_corners, y_corners, z_corners])
     
+    # Rotation matrix (corrected for KITTI convention)
     R = np.array([
         [np.cos(ry), 0, -np.sin(ry)],
         [0, 1, 0],
@@ -178,13 +239,16 @@ def project_3d_box(box_3d, K):
     ])
     corners_3d = R @ corners_3d
     
+    # Translate to camera coordinates
     corners_3d[0, :] += x
     corners_3d[1, :] += y
     corners_3d[2, :] += z
     
+    # Check if behind camera
     if np.any(corners_3d[2, :] <= 0.1):
         return None
     
+    # Project to 2D
     corners_2d = K @ corners_3d
     corners_2d = corners_2d[:2, :] / corners_3d[2, :]
     
@@ -192,7 +256,7 @@ def project_3d_box(box_3d, K):
 
 
 def draw_3d_box(frame, box_3d, K, color=(0, 255, 0), thickness=2, score=None, class_name=None):
-    """Draw 3D box on frame"""
+    """Draw 3D bounding box on frame"""
     corners_2d = project_3d_box(box_3d, K)
     
     if corners_2d is None:
@@ -200,21 +264,23 @@ def draw_3d_box(frame, box_3d, K, color=(0, 255, 0), thickness=2, score=None, cl
     
     corners_2d = corners_2d.astype(np.int32)
     
-    # Draw edges
+    # Draw bottom face
     for i in range(4):
         cv2.line(frame, tuple(corners_2d[i]), tuple(corners_2d[(i+1)%4]), color, thickness)
     
+    # Draw top face
     for i in range(4, 8):
         cv2.line(frame, tuple(corners_2d[i]), tuple(corners_2d[4+(i+1)%4]), color, thickness)
     
+    # Draw vertical edges
     for i in range(4):
         cv2.line(frame, tuple(corners_2d[i]), tuple(corners_2d[i+4]), color, thickness)
     
-    # Front indicator
+    # Draw front indicator (blue dot)
     front_center = ((corners_2d[0] + corners_2d[3] + corners_2d[4] + corners_2d[7]) / 4).astype(np.int32)
     cv2.circle(frame, tuple(front_center), 5, (255, 0, 0), -1)
     
-    # Label
+    # Draw label
     if class_name and score is not None:
         label = f'{class_name} {score:.2f}'
     elif class_name:
@@ -228,7 +294,7 @@ def draw_3d_box(frame, box_3d, K, color=(0, 255, 0), thickness=2, score=None, cl
         cv2.putText(frame, label, label_pos, cv2.FONT_HERSHEY_SIMPLEX, 
                    0.7, color, 2, cv2.LINE_AA)
     
-    # Depth
+    # Draw depth
     depth_text = f'{box_3d[2]:.1f}m'
     depth_pos = (int(corners_2d[:, 0].min()), int(corners_2d[:, 1].max()) + 20)
     cv2.putText(frame, depth_text, depth_pos, cv2.FONT_HERSHEY_SIMPLEX, 
@@ -238,7 +304,7 @@ def draw_3d_box(frame, box_3d, K, color=(0, 255, 0), thickness=2, score=None, cl
 
 
 def process_fisheye_video(engine, video_path, output_path, conf_threshold=0.5, show_fps=True):
-    """Process fisheye video"""
+    """Process fisheye video with 3D detection"""
     print(f"\n{'='*60}")
     print(f"Processing fisheye video: {video_path}")
     print(f"{'='*60}\n")
@@ -261,7 +327,8 @@ def process_fisheye_video(engine, video_path, output_path, conf_threshold=0.5, s
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
     
-    K = engine.intrinsics_undistorted
+    # Use NORMALIZED intrinsics for visualization
+    K = engine.intrinsics_normalized
     
     inference_times = []
     detection_counts = []
@@ -285,7 +352,7 @@ def process_fisheye_video(engine, video_path, output_path, conf_threshold=0.5, s
         
         detection_counts.append(len(boxes_3d_filtered))
         
-        # Draw on undistorted frame
+        # Draw 3D boxes on undistorted frame
         frame_vis = frame_undistorted.copy()
         for box, score, cls in zip(boxes_3d_filtered, scores_filtered, class_names_filtered):
             color = CLASS_COLORS.get(cls, (0, 255, 0))
@@ -327,15 +394,23 @@ def process_fisheye_video(engine, video_path, output_path, conf_threshold=0.5, s
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Fisheye video inference for Entron F008A')
-    parser.add_argument('--checkpoint', type=str, required=True)
-    parser.add_argument('--video', type=str, required=True)
-    parser.add_argument('--output', type=str, required=True)
+    parser = argparse.ArgumentParser(
+        description='Fisheye video inference with intrinsics normalization'
+    )
+    parser.add_argument('--checkpoint', type=str, required=True,
+                       help='Path to model checkpoint')
+    parser.add_argument('--video', type=str, required=True,
+                       help='Path to input video')
+    parser.add_argument('--output', type=str, required=True,
+                       help='Path to output video')
     parser.add_argument('--fisheye-config', type=str, default=None,
-                       help='Path to JSON config file with fx, fy, cx, cy, k1-k4')
-    parser.add_argument('--conf-threshold', type=float, default=0.5)
-    parser.add_argument('--device', type=str, default='cuda')
-    parser.add_argument('--no-fps', action='store_true')
+                       help='Path to JSON config with fx, fy, cx, cy, k1-k4')
+    parser.add_argument('--conf-threshold', type=float, default=0.5,
+                       help='Confidence threshold for detections')
+    parser.add_argument('--device', type=str, default='cuda',
+                       help='Device: cuda or cpu')
+    parser.add_argument('--no-fps', action='store_true',
+                       help='Do not show FPS overlay')
     
     args = parser.parse_args()
     
