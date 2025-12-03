@@ -1,26 +1,37 @@
-"""Generate KITTI-format label files from images using the two-stage 3D detector.
+"""Generate KITTI-format label files from images or videos using the two-stage 3D detector.
 
-This script runs the trained model on one or more images and writes
-`label_2`-style text files with 3D boxes in KITTI format.
+Modes:
+  - Images / image directory:
+      * Runs 3D detection on one or more images.
+      * Writes KITTI `label_2`-style `.txt` files per image.
+  - Video:
+      * Treats each sampled frame as a KITTI image.
+      * Writes KITTI `label_2`-style `.txt` files per sampled frame.
+      * Optionally saves raw frames and frames with 3D boxes drawn.
 
-Usage example (regular KITTI-like camera):
-    python generate_kitti_labels_from_images.py \
-        --checkpoint outputs/two_stage/checkpoints/checkpoint_best.pth \
-        --input path/to/image_or_dir \
+Example (images, KITTI-like camera):
+    python generate_kitti_labels_from_images.py \\
+        --checkpoint checkpoint_best.pth \\
+        --input path/to/image_or_dir \\
         --output-dir outputs/generated_labels
 
-Usage example (fisheye camera with JSON config, undistorted internally):
-    python generate_kitti_labels_from_images.py \
-        --checkpoint outputs/two_stage/checkpoints/checkpoint_best.pth \
-        --input path/to/image_or_dir \
-        --output-dir outputs/generated_labels \
-        --fisheye-config path/to/fisheye_config.json
+Example (video, fisheye intrinsics, sampling every 2s and saving boxes):
+    python generate_kitti_labels_from_images.py \\
+        --checkpoint checkpoint_best.pth \\
+        --input record.mp4 \\
+        --output-dir outputs/video_labels \\
+        --frames-dir outputs/video_frames \\
+        --frames-boxes-dir outputs/video_frames_boxes \\
+        --generate-bounding-boxes \\
+        --frame-interval-seconds 2.0 \\
+        --fisheye-config intrinsics.json
 """
 
 import os
 import sys
 import argparse
 from pathlib import Path
+from typing import Optional
 import json
 
 import torch
@@ -366,9 +377,190 @@ def collect_image_paths(input_path):
     raise ValueError(f"Input not found: {input_path}")
 
 
+def project_3d_box(box_3d, K):
+    """Project a 3D box to 2D image coordinates (KITTI convention)."""
+    x, y, z, h, w, l, ry = box_3d
+
+    # 8 corners in object coordinates
+    x_corners = [l / 2, -l / 2, -l / 2, l / 2, l / 2, -l / 2, -l / 2, l / 2]
+    y_corners = [h / 2, h / 2, h / 2, h / 2, -h / 2, -h / 2, -h / 2, -h / 2]
+    z_corners = [w / 2, w / 2, -w / 2, -w / 2, w / 2, w / 2, -w / 2, -w / 2]
+
+    corners_3d = np.array([x_corners, y_corners, z_corners])
+
+    # Rotation around Y
+    R = np.array(
+        [
+            [np.cos(ry), 0, -np.sin(ry)],
+            [0, 1, 0],
+            [np.sin(ry), 0, np.cos(ry)],
+        ]
+    )
+    corners_3d = R @ corners_3d
+
+    # Translate to camera coordinates
+    corners_3d[0, :] += x
+    corners_3d[1, :] += y
+    corners_3d[2, :] += z
+
+    # Discard boxes behind camera
+    if np.any(corners_3d[2, :] <= 0.1):
+        return None
+
+    # Project
+    corners_2d = K @ corners_3d
+    corners_2d = corners_2d[:2, :] / corners_3d[2, :]
+
+    return corners_2d.T
+
+
+def draw_3d_box(image, box_3d, K, color=(0, 255, 0), thickness=2):
+    """Draw a projected 3D bounding box on the image."""
+    corners_2d = project_3d_box(box_3d, K)
+    if corners_2d is None:
+        return image
+
+    image = image.copy()
+    corners_2d = corners_2d.astype(np.int32)
+
+    # Bottom face
+    for i in range(4):
+        cv2.line(image, tuple(corners_2d[i]), tuple(corners_2d[(i + 1) % 4]), color, thickness)
+
+    # Top face
+    for i in range(4, 8):
+        cv2.line(
+            image,
+            tuple(corners_2d[i]),
+            tuple(corners_2d[4 + (i + 1) % 4]),
+            color,
+            thickness,
+        )
+
+    # Vertical edges
+    for i in range(4):
+        cv2.line(image, tuple(corners_2d[i]), tuple(corners_2d[i + 4]), color, thickness)
+
+    # Front indicator
+    front_center = (
+        (corners_2d[0] + corners_2d[3] + corners_2d[4] + corners_2d[7]) / 4
+    ).astype(np.int32)
+    cv2.circle(image, tuple(front_center), 4, (255, 0, 0), -1)
+
+    return image
+
+
+def is_video_path(path: Path) -> bool:
+    """Heuristic: treat certain extensions as video files."""
+    return path.suffix.lower() in {".mp4", ".avi", ".mov", ".mkv", ".wmv"}
+
+
+def process_video(
+    engine: LabelGenerationEngine,
+    video_path: Path,
+    labels_dir: Path,
+    frames_dir: Optional[Path],
+    frames_boxes_dir: Optional[Path],
+    conf_threshold: float,
+    frame_interval_seconds: float,
+    generate_bounding_boxes: bool,
+):
+    """Process a video, writing KITTI labels per frame and optional frame PNGs."""
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise ValueError(f"Cannot open video: {video_path}")
+
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or None
+
+    # Compute frame step from time interval
+    if frame_interval_seconds <= 0 or fps <= 0:
+        frame_step = 1
+    else:
+        frame_step = max(1, int(round(frame_interval_seconds * fps)))
+
+    print(f"Video FPS: {fps:.2f}, sampling every {frame_step} frames")
+
+    labels_dir.mkdir(parents=True, exist_ok=True)
+    if frames_dir is not None:
+        frames_dir.mkdir(parents=True, exist_ok=True)
+    if frames_boxes_dir is not None and generate_bounding_boxes:
+        frames_boxes_dir.mkdir(parents=True, exist_ok=True)
+
+    pbar = tqdm(total=total_frames, desc="Processing video frames")
+    frame_idx = 0
+    sample_idx = 0
+
+    while True:
+        ret, frame_bgr = cap.read()
+        if not ret:
+            break
+
+        pbar.update(1)
+
+        # Only process every Nth frame
+        if frame_idx % frame_step != 0:
+            frame_idx += 1
+            continue
+
+        image = frame_bgr
+
+        boxes_3d, boxes_2d, scores, class_names, _ = engine.predict_image(image)
+
+        # Confidence filtering
+        keep_mask = scores >= conf_threshold
+        boxes_3d_kept = boxes_3d[keep_mask]
+        boxes_2d_kept = boxes_2d[keep_mask]
+        scores_kept = scores[keep_mask]
+        class_names_kept = [
+            class_names[i] for i in range(len(class_names)) if keep_mask[i]
+        ]
+
+        # Frame stem in KITTI style: 6-digit zero-padded index
+        stem = f"{sample_idx:06d}"
+        dummy_image_path = labels_dir / f"{stem}.png"
+
+        if len(boxes_3d_kept) > 0:
+            write_kitti_labels(
+                dummy_image_path,
+                boxes_3d_kept,
+                boxes_2d_kept,
+                scores_kept,
+                class_names_kept,
+                labels_dir,
+            )
+        else:
+            (labels_dir / f"{stem}.txt").touch()
+
+        # Save raw frame if requested
+        if frames_dir is not None:
+            cv2.imwrite(str(frames_dir / f"{stem}.png"), frame_bgr)
+
+        # Save frame with 3D boxes if requested
+        if frames_boxes_dir is not None and generate_bounding_boxes:
+            frame_box = frame_bgr.copy()
+            K = engine.intrinsics
+            for box_3d in boxes_3d_kept:
+                frame_box = draw_3d_box(frame_box, box_3d, K)
+            cv2.imwrite(str(frames_boxes_dir / f"{stem}.png"), frame_box)
+
+        sample_idx += 1
+        frame_idx += 1
+
+    pbar.close()
+    cap.release()
+
+    print(f"\nFinished. Processed {frame_idx} frames, sampled {sample_idx} frames.")
+    print(f"Labels written to: {labels_dir}")
+    if frames_dir is not None:
+        print(f"Frames written to: {frames_dir}")
+    if frames_boxes_dir is not None and generate_bounding_boxes:
+        print(f"Frames with 3D boxes written to: {frames_boxes_dir}")
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Generate KITTI-format labels from images using the two-stage 3D detector",
+        description="Generate KITTI-format labels from images or video using the two-stage 3D detector",
     )
     parser.add_argument(
         "--checkpoint",
@@ -380,7 +572,7 @@ def main():
         "--input",
         type=str,
         required=True,
-        help="Input image or directory of images",
+        help="Input image, directory of images, or video file",
     )
     parser.add_argument(
         "--output-dir",
@@ -417,6 +609,29 @@ def main():
         default="cuda",
         help="Device: cuda or cpu",
     )
+    parser.add_argument(
+        "--frames-dir",
+        type=str,
+        default=None,
+        help="(Video only) Directory to save sampled raw frames as PNG",
+    )
+    parser.add_argument(
+        "--frames-boxes-dir",
+        type=str,
+        default=None,
+        help="(Video only) Directory to save frames with 3D boxes drawn",
+    )
+    parser.add_argument(
+        "--generate-bounding-boxes",
+        action="store_true",
+        help="If set, also save frames with projected 3D boxes (video only)",
+    )
+    parser.add_argument(
+        "--frame-interval-seconds",
+        type=float,
+        default=0.0,
+        help="(Video only) Sample one frame every N seconds (0 = every frame)",
+    )
 
     args = parser.parse_args()
 
@@ -436,47 +651,63 @@ def main():
         dim_scale=args.dim_scale,
     )
 
-    # Collect images
-    image_paths = collect_image_paths(args.input)
-    print(f"\nFound {len(image_paths)} images")
+    input_path = Path(args.input)
+    labels_dir = Path(args.output_dir)
 
-    # Process images
-    for img_path in tqdm(image_paths, desc="Generating labels"):
-        image = cv2.imread(str(img_path))
-        if image is None:
-            print(f"Warning: Could not read image: {img_path}")
-            continue
-
-        boxes_3d, boxes_2d, scores, class_names, image_processed = engine.predict_image(
-            image
+    # Video mode
+    if input_path.is_file() and is_video_path(input_path):
+        frames_dir = Path(args.frames_dir) if args.frames_dir else None
+        frames_boxes_dir = (
+            Path(args.frames_boxes_dir) if args.frames_boxes_dir else None
         )
 
-        # Confidence filtering
-        keep_mask = scores >= args.conf_threshold
-        boxes_3d = boxes_3d[keep_mask]
-        boxes_2d = boxes_2d[keep_mask]
-        scores_filtered = scores[keep_mask]
-        class_names_filtered = [
-            class_names[i] for i in range(len(class_names)) if keep_mask[i]
-        ]
-
-        if len(boxes_3d) == 0:
-            # Still write an empty file to indicate no objects
-            out_dir = Path(args.output_dir)
-            out_dir.mkdir(parents=True, exist_ok=True)
-            stem = Path(img_path).stem
-            label_path = out_dir / f"{stem}.txt"
-            open(label_path, "w").close()
-            continue
-
-        write_kitti_labels(
-            img_path,
-            boxes_3d,
-            boxes_2d,
-            scores_filtered,
-            class_names_filtered,
-            args.output_dir,
+        process_video(
+            engine=engine,
+            video_path=input_path,
+            labels_dir=labels_dir,
+            frames_dir=frames_dir,
+            frames_boxes_dir=frames_boxes_dir,
+            conf_threshold=args.conf_threshold,
+            frame_interval_seconds=args.frame_interval_seconds,
+            generate_bounding_boxes=args.generate_bounding_boxes,
         )
+    else:
+        # Image or directory of images
+        image_paths = collect_image_paths(args.input)
+        print(f"\nFound {len(image_paths)} images")
+
+        for img_path in tqdm(image_paths, desc="Generating labels"):
+            image = cv2.imread(str(img_path))
+            if image is None:
+                print(f"Warning: Could not read image: {img_path}")
+                continue
+
+            boxes_3d, boxes_2d, scores, class_names, _ = engine.predict_image(image)
+
+            # Confidence filtering
+            keep_mask = scores >= args.conf_threshold
+            boxes_3d_keep = boxes_3d[keep_mask]
+            boxes_2d_keep = boxes_2d[keep_mask]
+            scores_filtered = scores[keep_mask]
+            class_names_filtered = [
+                class_names[i] for i in range(len(class_names)) if keep_mask[i]
+            ]
+
+            if len(boxes_3d_keep) == 0:
+                out_dir = labels_dir
+                out_dir.mkdir(parents=True, exist_ok=True)
+                stem = Path(img_path).stem
+                (out_dir / f"{stem}.txt").touch()
+                continue
+
+            write_kitti_labels(
+                img_path,
+                boxes_3d_keep,
+                boxes_2d_keep,
+                scores_filtered,
+                class_names_filtered,
+                labels_dir,
+            )
 
 
 if __name__ == "__main__":

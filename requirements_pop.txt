@@ -79,9 +79,6 @@ six==1.16.0
 sympy==1.14.0
 tensorboard==2.20.0
 tensorboard-data-server==0.7.2
-tensorrt @ file:///home/ashwin-benchdev/Documents/TensorRT-10.13.3.9/python/tensorrt-10.13.3.9-cp310-none-linux_x86_64.whl
-tensorrt_dispatch @ file:///home/ashwin-benchdev/Documents/TensorRT-10.13.3.9/python/tensorrt_dispatch-10.13.3.9-cp310-none-linux_x86_64.whl
-tensorrt_lean @ file:///home/ashwin-benchdev/Documents/TensorRT-10.13.3.9/python/tensorrt_lean-10.13.3.9-cp310-none-linux_x86_64.whl
 textparser==0.24.0
 torch==2.4.1
 torchvision==0.19.1
