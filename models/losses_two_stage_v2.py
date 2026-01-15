@@ -15,6 +15,7 @@ import numpy as np
 def compute_3d_iou(boxes_pred, boxes_gt):
     """
     Compute 3D IoU between predicted and ground truth boxes
+    Simplified axis-aligned approximation for speed
     
     Args:
         boxes_pred: [N, 7] predicted boxes [x, y, z, h, w, l, ry]
@@ -23,31 +24,45 @@ def compute_3d_iou(boxes_pred, boxes_gt):
     Returns:
         [N] IoU values
     """
-    # Simplified IoU computation (can be improved with rotated IoU)
-    # For now, use axis-aligned bounding box approximation
-    
     def box_volume(boxes):
         return boxes[:, 3] * boxes[:, 4] * boxes[:, 5]  # h * w * l
     
     vol_pred = box_volume(boxes_pred)
     vol_gt = box_volume(boxes_gt)
     
-    # Compute overlap (simplified - assumes small rotation differences)
+    # Compute overlap in each dimension (axis-aligned approximation)
+    # This ignores rotation for speed - good enough for training signal
+    
+    # X overlap (lateral)
+    x_min_pred = boxes_pred[:, 0] - boxes_pred[:, 5] / 2  # x - l/2
+    x_max_pred = boxes_pred[:, 0] + boxes_pred[:, 5] / 2
+    x_min_gt = boxes_gt[:, 0] - boxes_gt[:, 5] / 2
+    x_max_gt = boxes_gt[:, 0] + boxes_gt[:, 5] / 2
+    
     x_overlap = torch.clamp(
-        torch.min(boxes_pred[:, 0] + boxes_pred[:, 5]/2, boxes_gt[:, 0] + boxes_gt[:, 5]/2) - 
-        torch.max(boxes_pred[:, 0] - boxes_pred[:, 5]/2, boxes_gt[:, 0] - boxes_gt[:, 5]/2),
+        torch.min(x_max_pred, x_max_gt) - torch.max(x_min_pred, x_min_gt),
         min=0
     )
+    
+    # Y overlap (vertical)
+    y_min_pred = boxes_pred[:, 1] - boxes_pred[:, 3] / 2
+    y_max_pred = boxes_pred[:, 1] + boxes_pred[:, 3] / 2
+    y_min_gt = boxes_gt[:, 1] - boxes_gt[:, 3] / 2
+    y_max_gt = boxes_gt[:, 1] + boxes_gt[:, 3] / 2
     
     y_overlap = torch.clamp(
-        torch.min(boxes_pred[:, 1] + boxes_pred[:, 3]/2, boxes_gt[:, 1] + boxes_gt[:, 3]/2) - 
-        torch.max(boxes_pred[:, 1] - boxes_pred[:, 3]/2, boxes_gt[:, 1] - boxes_gt[:, 3]/2),
+        torch.min(y_max_pred, y_max_gt) - torch.max(y_min_pred, y_min_gt),
         min=0
     )
     
+    # Z overlap (depth)
+    z_min_pred = boxes_pred[:, 2] - boxes_pred[:, 4] / 2
+    z_max_pred = boxes_pred[:, 2] + boxes_pred[:, 4] / 2
+    z_min_gt = boxes_gt[:, 2] - boxes_gt[:, 4] / 2
+    z_max_gt = boxes_gt[:, 2] + boxes_gt[:, 4] / 2
+    
     z_overlap = torch.clamp(
-        torch.min(boxes_pred[:, 2] + boxes_pred[:, 4]/2, boxes_gt[:, 2] + boxes_gt[:, 4]/2) - 
-        torch.max(boxes_pred[:, 2] - boxes_pred[:, 4]/2, boxes_gt[:, 2] - boxes_gt[:, 4]/2),
+        torch.min(z_max_pred, z_max_gt) - torch.max(z_min_pred, z_min_gt),
         min=0
     )
     
@@ -83,9 +98,11 @@ class DimensionLoss(nn.Module):
 
 
 class DirectionLoss(nn.Module):
-    """Direction classification loss"""
-    def __init__(self):
+    """Direction loss with EXTREME settings to prevent mode collapse"""
+    def __init__(self, alpha=0.75, gamma=3.0):  # EXTREME PARAMETERS
         super().__init__()
+        self.alpha = alpha  # Increased from 0.25
+        self.gamma = gamma  # Increased from 2.0
     
     def forward(self, pred_direction_logits, gt_rotation):
         """
@@ -94,12 +111,33 @@ class DirectionLoss(nn.Module):
             gt_rotation: [N] rotation in radians [-π, π]
         """
         # Convert rotation to direction class
-        # 0: rotation in [0, π], 1: rotation in [-π, 0)
         gt_direction = (gt_rotation < 0).long()
         
-        loss = F.cross_entropy(pred_direction_logits, gt_direction)
+        # Compute class weights (inverse frequency)
+        n_class_0 = (gt_direction == 0).sum().float()
+        n_class_1 = (gt_direction == 1).sum().float()
+        total = n_class_0 + n_class_1
+        
+        if n_class_1 > 0:
+            weight_0 = total / (2.0 * n_class_0 + 1e-6)
+            weight_1 = total / (2.0 * n_class_1 + 1e-6)
+        else:
+            weight_0 = 1.0
+            weight_1 = 1.0
+        
+        weights = torch.tensor([weight_0, weight_1], 
+                              device=pred_direction_logits.device, 
+                              dtype=pred_direction_logits.dtype)
+        
+        # Weighted focal loss
+        ce_loss = F.cross_entropy(pred_direction_logits, gt_direction, 
+                                  weight=weights, reduction='none')
+        p_t = torch.exp(-ce_loss)
+        focal_weight = self.alpha * (1 - p_t) ** self.gamma
+        loss = (focal_weight * ce_loss).mean()
+        
         return loss
-
+    
 
 class RotationLoss(nn.Module):
     """Rotation loss with bin classification + residual"""
@@ -166,7 +204,7 @@ class Total3DLossV2(nn.Module):
             loss_weights = {
                 'depth': 1.0,
                 'dimension': 1.0,
-                'direction': 0.5,
+                'direction': 2.0,     # Increased from 0.5 to fight mode collapse
                 'rotation': 1.0,
                 'iou': 1.0,
                 'foreground': 0.3
@@ -175,7 +213,7 @@ class Total3DLossV2(nn.Module):
         
         self.depth_loss = DepthLoss()
         self.dimension_loss = DimensionLoss()
-        self.direction_loss = DirectionLoss()
+        self.direction_loss = DirectionLoss(alpha=0.25, gamma=2.0)  # Focal loss
         self.rotation_loss = RotationLoss()
         self.iou_loss = IoULoss()
         self.foreground_loss = ForegroundLoss()
