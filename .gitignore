@@ -18,4 +18,8 @@ __pycache__/
 *.jpeg
 
 # output directory
+outputs/*.onnx
+
+# Ignore large models and logs
+*.onnx
 outputs/
