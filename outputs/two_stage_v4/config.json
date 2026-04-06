@@ -1,0 +1,16 @@
+{
+  "data_root": "/media/ashwin-benchdev/eb2a8889-3ec9-411a-826e-816cf9759b02/KITTI-3D",
+  "classes": [
+    "Car",
+    "Pedestrian",
+    "Cyclist"
+  ],
+  "epochs": 50,
+  "batch_size": 8,
+  "lr": 0.0001,
+  "workers": 4,
+  "output_dir": "outputs/two_stage_v4",
+  "resume": null,
+  "early_stop_patience": 10,
+  "grad_clip": 10.0
+}

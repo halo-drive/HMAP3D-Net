@@ -1,0 +1,13 @@
+{
+  "data_root": "/home/ashwin-benchdev/NetAsh3D/domain_dataset",
+  "classes": [
+    "Car"
+  ],
+  "epochs": 100,
+  "batch_size": 2,
+  "lr": 5e-05,
+  "workers": 0,
+  "output_dir": "/home/ashwin-benchdev/NetAsh3D/outputs/domain_finetuning",
+  "resume": "/home/ashwin-benchdev/NetAsh3D/outputs/two_stage_regularized/checkpoints/checkpoint_best.pth",
+  "viz_interval": 10
+}

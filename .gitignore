@@ -22,4 +22,5 @@ outputs/*.onnx
 
 # Ignore large models and logs
 *.onnx
-outputs/
+outputs/*.pth
+outputs/*.mp4

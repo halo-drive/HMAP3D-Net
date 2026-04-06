@@ -1,0 +1,35 @@
+{
+  "experiment": {
+    "name": "netash_baseline_MSE",
+    "output_dir": "./outputs/experiments"
+  },
+  "dataset": {
+    "root_dir": "/media/ashwin-benchdev/eb2a8889-3ec9-411a-826e-816cf9759b02/NuScenes-Full-Dataset"
+  },
+  "model": {
+    "input_size": [
+      720,
+      1280
+    ]
+  },
+  "training": {
+    "batch_size": 8,
+    "epochs": 50,
+    "learning_rate": 5e-05,
+    "weight_decay": 0.0001,
+    "num_workers": 4,
+    "use_amp": true,
+    "grad_clip": 5.0,
+    "save_interval": 5,
+    "log_interval": 50,
+    "visualize_interval": 5,
+    "resume_checkpoint": "outputs/experiments/netash_baseline_MSE_20251111_144516/checkpoints/checkpoint_latest.pth"
+  },
+  "loss_weights": {
+    "heatmap": 1.0,
+    "depth": 1.0,
+    "dimension": 0.1,
+    "rotation": 0.5,
+    "offset": 0.1
+  }
+}

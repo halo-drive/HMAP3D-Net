@@ -1,0 +1,23 @@
+======================================================================
+nuScenes CAM_FRONT Vehicle Depth Distribution Analysis
+======================================================================
+
+Total vehicle samples: 322907
+Depth range: 0.00m - 199.83m
+Mean: 30.22m, Median: 25.11m
+Std: 23.62m
+
+RECOMMENDED CONFIGURATION FOR NETWORK:
+----------------------------------------------------------------------
+Number of depth bins: 6
+Bin boundaries: [0, 10, 20, 35, 50, 70, 200]
+
+Bin configuration for network head:
+  Bin 0: [  0- 10m) -   68033 samples (21.07%)
+  Bin 1: [ 10- 20m) -   63622 samples (19.70%)
+  Bin 2: [ 20- 35m) -   79532 samples (24.63%)
+  Bin 3: [ 35- 50m) -   52999 samples (16.41%)
+  Bin 4: [ 50- 70m) -   36214 samples (11.21%)
+  Bin 5: [ 70-200m) -   22507 samples ( 6.97%)
+
+======================================================================
